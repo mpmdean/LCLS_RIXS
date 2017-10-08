@@ -1,3 +1,3 @@
 # LCLS_RIXS
 
-Simple scripts for analyzing RIXS data. 
+Simple scripts for analyzing the smalldata produced at XPP. 
