@@ -1,7 +1,12 @@
 import numpy as np
+import pandas as pd
 import h5py
 import os
 from collections import OrderedDict
+from scipy.stats import binned_statistic
+
+import dask
+import dask.array as da
 
 """
 Funtions for analyzing XPP small data
@@ -22,29 +27,36 @@ def get_Motors(f, Motors=OrderedDict()):
     Extra values scan be added by specifing motors as OrderedDic
     """
     # Load droplets
-    
+
     Motors.update(OrderedDict(
         x ='epix/droplet_X',
         y = 'epix/droplet_Y',
         ADU = 'epix/droplet_adu',
         Npix = 'epix/droplet_npix',
-        ipm = 'ipm3/sum',
+        ipm2 = 'ipm2/sum',
+        ipm3 = 'ipm3/sum',
         jitter = 'epics/lxt_ttc',
         laser = 'lightStatus/laser',
         xray = 'lightStatus/xray'
                  )
                  )
-    
+    Motors.update({'diodeU': 'diodeU/channels', 'delay_correction': 'phase_cav/fit_time_2'})
     # Load user motors
     user_motors = list(f['epicsUser'].keys())
     for motor in user_motors:
         Motors[motor] = 'epicsUser/'+ motor
-    
+
     # Load epics motors
     epics_motors = list(f['epics'].keys())
     epics_motors_used = [key for key in epics_motors if ('robot' not in key and 'slit' not in key)]
     for motor in epics_motors_used:
         Motors[motor] = 'epics/' + motor
+
+    # Load scan motor
+    if len(f['scan'].keys()) >=3:
+        first_key = 'scan/' + list(f['scan'].keys())[0]
+        Motors[first_key] = first_key
+
     return Motors
 
 def get_data(run, Motors=OrderedDict(), fpath=None):
@@ -56,13 +68,22 @@ def get_data(run, Motors=OrderedDict(), fpath=None):
     f = h5py.File(fpath)
     allIPM = f[I0_key].value
     goodIPM = (allIPM>ipm_threshold)
-    
+
     if Motors == OrderedDict():
         Motors.update(get_Motors(f))
-    
+
     d = OrderedDict()
     for key, name in Motors.items():
-        d[key] = f[name].value[goodIPM]
+        try:
+            d[key] = f[name].value[goodIPM]
+        except KeyError:
+            print("key {} not found!".format(key))
+
+    try:
+        d['corrected_delay'] = d['scan/lxt']*1.*10**12 + d['delay_correction']
+    except KeyError:
+        pass
+
     return d
 
 def combine(list_of_d):
@@ -74,7 +95,7 @@ def combine(list_of_d):
             d_combined[key] = np.hstack((d[key] for d in list_of_d))
         else:
             d_combined[key] = np.vstack((d[key] for d in list_of_d))
-    
+
     return d_combined
 
 def clean_data(d, selectkey='ADU', minkey=min_ADU, maxkey=1000, minx=-np.inf, maxx=np.inf, miny=-np.inf, maxy=np.inf):
@@ -92,7 +113,7 @@ def clean_data(d, selectkey='ADU', minkey=min_ADU, maxkey=1000, minx=-np.inf, ma
         try:
             d_clean[key] = d[key][choose_events]
         except IndexError:
-            d_clean[key] = d[key]    
+            d_clean[key] = d[key]
     return d_clean
 
 def select_scan(d, motorkey, motorPos, tolerance=1.e-5):
@@ -110,7 +131,7 @@ def select_scan(d, motorkey, motorPos, tolerance=1.e-5):
 
 def select(d, motorkey, motorval, tolerance=1.e-5):
     '''
-    Return a selected version of d 
+    Return a selected version of d
     '''
     goodshots = np.logical_and(d[motorkey]>motorval-tolerance, d[motorkey]<=motorval+tolerance)
     d_select = OrderedDict()
@@ -164,65 +185,147 @@ def make_image(d):
     M, _, _ = np.histogram2d(d['y'], d['x'],  bins=(y_edges, x_edges), weights=d['ADU'])
     return x_centers, y_centers, M
 
+def get_d(run, ADU_per_photon=190, minx = 140, maxx = 240, miny=100, maxy=380):
+    """Wrapper to pull everything using the traditional method"""
+    print("Run = {}".format(run))
+    d = get_data(run)
+    d_clean = clean_data(d, selectkey='ADU', minkey=170, maxkey=1000, minx=minx, maxx=maxx, miny=miny, maxy=maxy)
+    return d_clean
 
-# SOME OLD PATHS TO FIELDS HERE
-#folder = '/reg/d/psdm/xpp/xppl1316/res/littleData/ftc'
-#fpath = os.path.join(folder, 'ldat_xppl1316_Run{}.h5'.format(run))
+def get_RIXS_multi(runs, ADU_per_photon=190, minADU=170, maxADU=1000, minx=140, maxx=240, miny=100, maxy=380, binsize=1, elPix=0, laser_select=None, xray_select=None, slope=0):
+    """Fast get of RIXS data"""
+    d = combine([get_data(run) for run in runs])
+    if laser_select != None:
+        d = select(d, 'laser', laser_select)
+    if xray_select != None:
+        d = select(d, 'xray', xray_select)
+
+    d = clean_data(d, selectkey='ADU', minkey=minADU, maxkey=maxADU, minx=minx, maxx=maxx, miny=miny, maxy=maxy)
+    x, y, M = make_image(d)
+    pixels_edges, pixel_centers = bin_edges_centers(miny, maxy, binsize)
+    #E, I = bin_rixs(d['y'], pixels_edges, d['ADU']/ADU_per_photon, elPix = elPix)
+    E, I = bin_rixs_slope(d['x'], d['y'], pixels_edges, d['ADU']/ADU_per_photon, elPix = elPix, slope=slope)
+    M /= ADU_per_photon
+    X, Y = np.meshgrid(x, y)
+
+    RIXS = OrderedDict(d=d, E=E, I=I, M=M, X=X, Y=Y, run=runs)
+    return RIXS
+
+def get_RIXS(run, ADU_per_photon=190, minADU=170, maxADU=1000, minx=140, maxx=240, miny=100, maxy=380, binsize=1, elPix=0, laser_select=None, xray_select=None):
+    """Fast get of RIXS data"""
+    d = get_data(run)
+    if laser_select != None:
+        d = select(d, 'laser', laser_select)
+    if xray_select != None:
+        d = select(d, 'xray', xray_select)
+
+    d = clean_data(d, selectkey='ADU', minkey=minADU, maxkey=maxADU, minx=minx, maxx=maxx, miny=miny, maxy=maxy)
+    x, y, M = make_image(d)
+    pixels_edges, pixel_centers = bin_edges_centers(miny, maxy, binsize)
+    E, I = bin_rixs(d['y'], pixels_edges, d['ADU']/ADU_per_photon, elPix = elPix)
+    M /= ADU_per_photon
+    X, Y = np.meshgrid(x, y)
+
+    RIXS = OrderedDict(d=d, E=E, I=I, M=M, X=X, Y=Y, run=run)
+    return RIXS
+
+# def get_d_fast(run, ADU_per_photon=190, minADU=170, maxADU=1000, minx=140, maxx=240, miny=100, maxy=380, laser_select=None, xray_select=None):
+#     """Fast pull of minimum d parallelized using dask"""
+#     print("Run = {}".format(run))
+#     fpath = os.path.join(folder, 'xpplp7515_Run{:03d}.h5'.format(run))
+#     f = h5py.File(fpath)
 #
-#    d = OrderedDict(
-#        x =f['epix/droplet_X'].value[goodIPM],
-#        y = f['epix/droplet_Y'].value[goodIPM],
-#        ADU = f['epix/droplet_adu'].value[goodIPM],
-#        Npix = f['epix/droplet_npix'].value[goodIPM],
-#        ipm = f['ipm3/sum'].value[goodIPM],
-#        jitter = f['epics/lxt_ttc'].value[goodIPM],
-#        laser = f['lightStatus/laser'].value[goodIPM],
-#        xray = f['lightStatus/xray'].value[goodIPM]
-#                 )
+#     ipm2 = da.from_array(f['ipm2/sum'], chunks=(2e6))
+#     ipm3 = da.from_array(f['ipm3/sum'], chunks=(2e6))
+#     laser = da.from_array(f['lightStatus/laser'], chunks=(2e6))
+#     xray = da.from_array(f['lightStatus/xray'], chunks=(2e6))
 #
-#def get_data(run, ScanMotors={}, fpath=None):
-#    if fpath == None:
-#        #fpath = os.path.join(folder, 'ldat_xppl1316_Run{}.h5'.format(run))
-#        fpath = os.path.join(folder, 'xpplp7515_Run{}.h5'.format(str(run).zfill(3)))
+#     chunks = (2000, 2000)
+#     x = da.from_array(f['epix/droplet_X'], chunks=chunks)
+#     y = da.from_array(f['epix/droplet_Y'],  chunks=chunks)
+#     ADU = da.from_array(f['epix/droplet_adu'], chunks=chunks)
+#
+#     if laser_select != None:
+#         print("laser select not implemented!!!!! As much slower")
+#         #pick = (laser == laser_select).compute()
+#         #ipm2 = ipm2[pick]
+#         #ipm3 = ipm3[pick]
+#         #xray = xray[pick]
+#         #laser = laser[pick]
+#         #x = x[pick,:]
+#         #y = y[pick,:]
+#         #ADU = ADU[pick,:]
+#     if xray_select != None:
+#         print("xray select not implemented!!!!! As much slower")
+#
+#     choose = (x>minx) & (x<=maxx) & (y>miny) & (y<=maxy) & (ADU>minADU) & (ADU<=maxADU)
+#
+#
+#
+#     results_list = dask.compute(x[choose], y[choose], ADU[choose], ipm2, ipm3, laser, xray)
+#
+#     return OrderedDict([key, val] for key, val in zip(['x', 'y', 'ADU', 'imp2', 'imp3', 'laser', 'xray'], results_list))
+
+#RIXS_list = [RIXS, RIXS, RIXS, RIXS]
+#
+#def combine_RIXS(RIXS_list):
+#    RIXStot = OrderedDict()
+#    for key in ['I', 'M']:
+#        RIXStot[key] = sum(RIXS[key] for RIXS in RIXS_list)
+#    for key in RIXS_list[0].keys():
+#        if key not in ['I', 'M', 'run', 'd']:
+#            RIXStot[key] = RIXS_list[0][key]
+#
+#    RIXStot['run'] = [RIXS['run'] for RIXS in RIXS_list]
+#    return RIXStot
+#
+#RIXStot = combine_RIXS(RIXS_list)
+
+#def get_d_fast(run, ADU_per_photon=190, minADU=170, maxADU=1000, minx=140, maxx=240, miny=100, maxy=380):
+#    """Fast pull of minimum d parallelized using dask"""
+#    print("Run = {}".format(run))
+#    fpath = os.path.join(folder, 'xpplp7515_Run{:03d}.h5'.format(run))
 #    f = h5py.File(fpath)
-#    allIPM = f['ipm3/sum'].value
-#    goodIPM = (allIPM>ipm_threshold)
 #
-#    d = OrderedDict(
-#        #x =f['epix/dropletsX'].value[goodIPM],
-#        #y = f['epix/dropletsY'].value[goodIPM],
-#        #ADU = f['epix/dropletsAdu'].value[goodIPM],
-#        #Npix = f['epix/dropletsNpix'].value[goodIPM],
-#        #ipm = f['ipm3/sum'].value[goodIPM],
-#        #jitter = f['epics/lxt_ttc'].value[goodIPM],
-#        #laser = f['lightStatus/laser'].value[goodIPM],
-#        #xray = f['lightStatus/xray'].value[goodIPM]
-#        
-#        x =f['epix/droplet_X'].value[goodIPM],
-#        y = f['epix/droplet_Y'].value[goodIPM],
-#        ADU = f['epix/droplet_adu'].value[goodIPM],
-#        Npix = f['epix/droplet_npix'].value[goodIPM],
-#        #ROI_sum = f['epix/ROI_sum'].value[goodIPM]
-#        #ROI_comx = f['epix/ROI_com'].value[goodIPM][:, 0]
-#        #ROI_comy = f['epix/ROI_com'].value[goodIPM][:, 1]
-#        ipm = f['ipm3/sum'].value[goodIPM],
-#        jitter = f['epics/lxt_ttc'].value[goodIPM],
-#        laser = f['lightStatus/laser'].value[goodIPM],
-#        xray = f['lightStatus/xray'].value[goodIPM]
-#                 )
-#    for key, name in ScanMotors.items():
-#        d[key] = f[name].value[goodIPM]
-#    return d
-#def get_data(run, ScanMotors={'delay': 'epics/lxt_ttc'}, fpath=None):
-#def get_data(run, ScanMotors={'samrot': 'scan/samrot'}, fpath=None):
+#    chunks = (2000, 2000)
+#    ipm = da.from_array(f['epix/droplet_X'], chunks=chunks)
+#    x = da.from_array(f['epix/droplet_X'], chunks=chunks)
+#    y = da.from_array(f['epix/droplet_Y'],  chunks=chunks)
+#    ADU = da.from_array(f['epix/droplet_adu'], chunks=chunks)
+#    choose = (x>minx) & (x<=maxx) & (y>miny) & (y<=maxy) & (ADU>minADU) & (ADU<=maxADU)
+#
+#    ipm2 = da.from_array(f['ipm2/sum'], chunks=(2e6))
+#    ipm3 = da.from_array(f['ipm3/sum'], chunks=(2e6))
+#
+#    laser = da.from_array(f['lightStatus/laser'], chunks=(2e6))
+#    xray = da.from_array(f['lightStatus/xray'], chunks=(2e6))
+#
+#    results_list = dask.compute(x[choose], y[choose], ADU[choose], ipm2, ipm3, laser, xray)
+#
+#    return OrderedDict([key, val] for key, val in zip(['x', 'y', 'ADU', 'imp2', 'imp3', 'laser', 'xray'], results_list))
 
-#def get_data(run, ScanMotors={}, fpath=None):
 
-#def get_rixs(fname, motor_cen, motor_window, y_edges, elPix=300, ScanMotor='ebeam/L3Energy'):
-#	""" convenience function combinding get_data and bin_rixs to return RIXS spectrum"""
-#	if type(fname) == str:
-#		DATA = get_data(fname, ScanMotor=ScanMotor)
-#	else:
-#		DATA = combine(*[get_data(filename, scanMotor=scanMotor) for filename in fname])
-#	y = select_time_ADU(DATA, motor_cen, motor_window)[1]
-#	return bin_rixs(y, y_edges, elPix)
+# def get_RIXS_fast(run, ADU_per_photon=190, minADU=170, maxADU=1000, minx=140, maxx=240, miny=100, maxy=380, binsize=1, elPix=0, laser_select=None, xray_select=None):
+#     """Fast get of RIXS data"""
+#     try:
+#         d = get_d_fast(run, minADU=minADU, maxADU=maxADU, ADU_per_photon=ADU_per_photon,
+#                        minx=minx, maxx=maxx, miny=miny, maxy=maxy,
+#                        laser_select=laser_select, xray_select=xray_select)
+#     except TypeError:
+#         d = combine([get_d_fast(run_val, minADU=minADU, maxADU=maxADU, ADU_per_photon=ADU_per_photon,
+#                                 minx=minx, maxx=maxx, miny=miny, maxy=maxy,
+#                                 laser_select=laser_select, xray_select=xray_select)
+#                      for run_val in run])
+#
+#     if laser_select != None:
+#         print("Cannot do this selection in fast version!!")
+#     if xray_select != None:
+#         dprint("Cannot do this selection in fast version!!")
+#     x, y, M = make_image(d)
+#     pixels_edges, pixel_centers = bin_edges_centers(miny, maxy, binsize)
+#     E, I = bin_rixs(d['y'], pixels_edges, d['ADU']/ADU_per_photon, elPix = elPix)
+#     M /= ADU_per_photon
+#     X, Y = np.meshgrid(x, y)
+#
+#     RIXS = OrderedDict(d=d, E=E, I=I, M=M, X=X, Y=Y, run=run)
+#     return RIXS
