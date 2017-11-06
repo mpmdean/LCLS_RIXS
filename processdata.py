@@ -5,9 +5,11 @@ import os
 from collections import OrderedDict
 import matplotlib.pyplot as plt
 
+
 """
 Funtions for analyzing XPP small data
 """
+
 ADU_per_photon = 195.
 min_ADU = 170.
 I0_key = 'ipm3/sum'
@@ -65,17 +67,20 @@ def get_Motors(f, Motors=OrderedDict()):
         Motors[first_key] = first_key
 
     # add phase cavity
-    Motors.update({'diodeU': 'diodeU/channels', 'delay_correction': 'phase_cav/fit_time_2'})
+    Motors.update({'delay_correction': 'phase_cav/fit_time_2'})
+    # is 'diodeU': 'diodeU/channels' needed??
 
     return Motors
 
+###########################################
+###########################################
 
 class Scan:
     """Container for returning data from h5 files suitable for RIXS.
     This is initalized with a list of runs and falls back on a list of filenames.
     Multiple runs will be contatenated.
     It also allows the user to define a dictionary of motors, which alias the (often cumersome)
-    names in the h5 file and """
+    names in the h5 file. These can be loaded into either an ordered dictionary or a xarray object. """
     def __init__(self, RunList):
         try:
             self.FileNameList = [get_filename(run) for run in RunList]
@@ -87,6 +92,7 @@ class Scan:
         self.Motors = get_Motors(self.h5files[0])
 
     def get_key(self, key):
+        """ return the value atribute correspoinding to key"""
         shape = self.h5files[0][key].shape
         if len(shape) == 1:
             return np.hstack(h5file[key].value for h5file in self.h5files)
@@ -94,6 +100,7 @@ class Scan:
             return np.vstack(h5file[key].value for h5file in self.h5files)
 
     def __getitem__(self, key):
+        """ return key where key is a h5 key or its alias defined in self.Motors"""
         try:
             value = self.get_key(self.Motors[key])
         except KeyError:
@@ -301,7 +308,7 @@ def plotRIXS(ax, RIXS, xmin=-0.5, xmax=1.5, norm=1, **kwargs):
     return art
 
 def save_RIXS(allRIXS, folder='.'):
-    """Save two npz arrays with everything apart from the class."""
+    """Save two npz arrays with everything apart from the S class."""
     for config in ['on', 'off']:
         save = allRIXS[config].copy()
         save.pop('S')
